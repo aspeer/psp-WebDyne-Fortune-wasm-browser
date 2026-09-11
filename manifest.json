@@ -1,0 +1,22 @@
+{
+  "generator": "@webdyne/webdyne-zeroperl-browser",
+  "version": "498757341e4e03248f2a",
+  "runtime": {
+    "name": "@webdyne/webdyne-zeroperl",
+    "version": "1.0.9"
+  },
+  "entry": "app.psp",
+  "bindings": {
+    "WEBDYNE_INDEX": "app.psp",
+    "WEBDYNE_STATIC": "1"
+  },
+  "files": [
+    "runtime.wasm",
+    "app-vfs.tar.gz",
+    "perl-lib-vfs.tar.gz",
+    "shell.js",
+    "perl-worker.js",
+    "index.html",
+    "service-worker.js"
+  ]
+}
