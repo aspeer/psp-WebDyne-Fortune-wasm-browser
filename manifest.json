@@ -1,6 +1,6 @@
 {
   "generator": "@webdyne/webdyne-zeroperl-browser",
-  "version": "40967ee574fa44a6aa88",
+  "version": "60a6251df10ab5f2d73f",
   "runtime": {
     "name": "@webdyne/webdyne-zeroperl",
     "version": "1.0.9"
