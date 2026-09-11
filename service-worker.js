@@ -64,7 +64,7 @@ function receiveResponse(port, signal) {
 // node_modules/@webdyne/webdyne-zeroperl-browser/browser/service-worker.js
 var base = new URL("./", self.location.href);
 var virtual = new URL("__webdyne_app/", base);
-var cacheName = `webdyne-local:${base.pathname}:${"498757341e4e03248f2a"}`;
+var cacheName = `webdyne-local:${base.pathname}:${"40967ee574fa44a6aa88"}`;
 var cachedUrls = new Set(define_CACHE_FILES_default.map((name) => new URL(name, base).href));
 cachedUrls.add(base.href);
 self.addEventListener("install", (event) => {
