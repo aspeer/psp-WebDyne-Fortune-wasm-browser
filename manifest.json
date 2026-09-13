@@ -1,9 +1,9 @@
 {
   "generator": "@webdyne/webdyne-zeroperl-browser",
-  "version": "60a6251df10ab5f2d73f",
+  "version": "714500a8c3b231f080a3",
   "runtime": {
     "name": "@webdyne/webdyne-zeroperl",
-    "version": "1.0.9"
+    "version": "1.0.15"
   },
   "entry": "app.psp",
   "bindings": {

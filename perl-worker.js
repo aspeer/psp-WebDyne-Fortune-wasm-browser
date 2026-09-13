@@ -3041,6 +3041,14 @@ sub start_session {
     my ($session_id, $scope_json, $entrypoint)=@_;
     die "Duplicate PAGI session $session_id\\n" if $SESSION{$session_id};
     no strict 'refs';
+    die "Invalid application entry point\\n"
+        unless ($entrypoint=~/\\A[A-Za-z_]\\w*(?:::[A-Za-z_]\\w*)+\\z/);
+    unless (*{$entrypoint}{'CODE'}) {
+        my $module_fn=$entrypoint;
+        $module_fn=~s/::[^:]+$//;
+        $module_fn=~s{::}{/}g;
+        require "$module_fn.pm";
+    }
     my $app_cr=*{$entrypoint}{'CODE'} or die "PAGI application entry point $entrypoint is not defined\\n";
     my $scope_hr=$json_or->decode($scope_json);
     die "PAGI scope must decode to a hash\\n" unless ref($scope_hr) eq 'HASH';
@@ -3292,10 +3300,13 @@ function extensionName(extension, index) {
 function cleanupFunction(value, name) {
   if (value === void 0 || value === null) return void 0;
   if (typeof value === "function") return value;
-  if (typeof value.release === "function") return () => value.release();
+  if (typeof value.release === "function") return (context) => value.release(context);
   throw new TypeError(`${name}.attachScope() must return a cleanup function, a release object, or nothing`);
 }
-function createExtensionManager(extensions = []) {
+function createExtensionManager(extensions = [], { cleanupTimeoutMs = 1e4 } = {}) {
+  if (!Number.isSafeInteger(cleanupTimeoutMs) || cleanupTimeoutMs < 1 || cleanupTimeoutMs > 2147483647) {
+    throw new TypeError("cleanupTimeoutMs must be an integer from 1 to 2147483647");
+  }
   if (!Array.isArray(extensions)) throw new TypeError("extensions must be an array");
   const installed = extensions.map((extension, index) => {
     if (!extension || typeof extension !== "object" || Array.isArray(extension)) {
@@ -3312,37 +3323,103 @@ function createExtensionManager(extensions = []) {
     register(perl) {
       for (const { extension } of installed) extension.register?.(perl);
     },
-    attachScope(context) {
+    async attachScope(context) {
       const cleanups = [];
-      let released = false;
+      let completion;
       const release = () => {
-        if (released) return;
-        released = true;
+        if (completion) return completion;
+        const controller = new AbortController();
         const errors = [];
+        let resolveCompletion;
+        let rejectCompletion;
+        completion = new Promise((resolve, reject) => {
+          resolveCompletion = resolve;
+          rejectCompletion = reject;
+        });
+        void completion.catch(() => void 0);
+        const timer = setTimeout(() => {
+          const error = new Error(`WebDyne extension cleanup exceeded ${cleanupTimeoutMs} ms`);
+          error.name = "ExtensionCleanupTimeoutError";
+          controller.abort(error);
+          rejectCompletion(errors.length ? new AggregateError([...errors, error], "WebDyne extension cleanup failed") : error);
+        }, cleanupTimeoutMs);
+        const pending = [];
         for (const cleanup of cleanups.reverse()) {
           try {
-            cleanup();
+            pending.push(Promise.resolve(cleanup({ signal: controller.signal })).catch((error) => {
+              errors.push(error);
+            }));
           } catch (error) {
             errors.push(error);
           }
         }
-        if (errors.length === 1) throw errors[0];
-        if (errors.length > 1) throw new AggregateError(errors, "WebDyne extension cleanup failed");
+        void Promise.all(pending).then(() => {
+          clearTimeout(timer);
+          if (errors.length === 1) rejectCompletion(errors[0]);
+          else if (errors.length > 1) rejectCompletion(new AggregateError(errors, "WebDyne extension cleanup failed"));
+          else resolveCompletion();
+        });
+        return completion;
       };
       try {
         for (const { extension, name } of installed) {
-          const cleanup = cleanupFunction(extension.attachScope?.(context), name);
+          const cleanup = cleanupFunction(extension.attachScope?.({ ...context, lifecycle: { asyncCleanup: true } }), name);
           if (cleanup) cleanups.push(cleanup);
         }
       } catch (error) {
         try {
-          release();
+          await release();
         } catch (cleanupError) {
           throw new AggregateError([error, cleanupError], "WebDyne extension attachment failed during cleanup");
         }
         throw error;
       }
       return release;
+    }
+  };
+}
+
+// node_modules/@webdyne/webdyne-zeroperl/js/transport/invocation.js
+function createInvocationTransport() {
+  let closed = false;
+  let sent = false;
+  let value;
+  let disconnect;
+  const disconnected = new Promise((resolve) => {
+    disconnect = resolve;
+  });
+  return {
+    connection: {
+      status: () => ({ connected: !closed, reason: closed ? "invocation_finished" : null }),
+      waitForDisconnect: () => disconnected
+    },
+    receiveSource: { next() {
+      throw new Error("Finite invocations do not receive PAGI events");
+    } },
+    sink: {
+      get started() {
+        return sent;
+      },
+      get finished() {
+        return sent;
+      },
+      send(event) {
+        if (closed || sent || event.type !== "invocation.result" || !Object.hasOwn(event, "value")) {
+          throw new Error("Invalid or duplicate invocation result");
+        }
+        value = event.value;
+        sent = true;
+      },
+      fail() {
+      }
+    },
+    result() {
+      if (!sent) throw new Error("Invocation completed without a result");
+      return value;
+    },
+    close() {
+      closed = true;
+      disconnect("invocation_finished");
     }
   };
 }
@@ -4098,7 +4175,9 @@ function createWebDyneRuntime({
   appVfsArchive,
   perlLibraryVfsArchive,
   webSocketAdapter,
-  extensions = []
+  extensions = [],
+  mode = "pagi",
+  extensionCleanupTimeoutMs = 1e4
 }) {
   if (!(zeroperlModule instanceof WebAssembly.Module)) {
     throw new TypeError("zeroperlModule must be an imported WebAssembly.Module");
@@ -4109,8 +4188,9 @@ function createWebDyneRuntime({
   if (!(perlLibraryVfsArchive instanceof ArrayBuffer)) {
     throw new TypeError("perlLibraryVfsArchive must be an imported ArrayBuffer");
   }
+  if (!["pagi", "invocation"].includes(mode)) throw new TypeError("Invalid WebDyne runtime mode");
   const assets = { appVfsArchive, perlLibraryVfsArchive };
-  const extensionManager = createExtensionManager(extensions);
+  const extensionManager = createExtensionManager(extensions, { cleanupTimeoutMs: extensionCleanupTimeoutMs });
   let perlFileSystemPromise;
   let persistentRuntimePromise;
   let persistentPerl;
@@ -4323,11 +4403,15 @@ function createWebDyneRuntime({
          $Pagi::WebDyne::CONFIG = $bootstrap->{applicationConfig};`
       );
       if (!configure.success) throw new Error(configure.error);
-      for (const file of [PAGI_RUNNER, WEBDYNE_APPLICATION]) {
+      for (const file of mode === "pagi" ? [PAGI_RUNNER, WEBDYNE_APPLICATION] : [PAGI_RUNNER]) {
         const load = await perl.runFile(file);
         if (!load.success) throw new Error(load.error);
       }
-      await startLifespan(generation);
+      if (mode === "invocation") {
+        const timers = await perl.eval("require Future::IO; require Future::IO::Impl::ZeroPerl; Future::IO->override_impl('Future::IO::Impl::ZeroPerl');");
+        if (!timers.success) throw new Error(timers.error);
+      }
+      if (mode === "pagi") await startLifespan(generation);
       return { perl, generation };
     } catch (error) {
       if (persistentPerl === perl) await resetPersistentRuntime(error);
@@ -4426,8 +4510,9 @@ function createWebDyneRuntime({
       };
     });
   }
-  async function startPersistentSession(scope, request, transport, runtimeConfig) {
+  async function startPersistentSession(scope, request, transport, runtimeConfig, entrypoint) {
     const session = createPagiSession(scope, request, transport);
+    session.entrypoint = entrypoint;
     void session.completion.catch(() => void 0);
     pagiSessions.set(session.id, session);
     try {
@@ -4444,7 +4529,7 @@ function createWebDyneRuntime({
     return enqueuePersistentPerl(session, "Pagi::ZeroPerl::Runner::start_session", (perl) => {
       const sessionValue = perl.createInt(session.id);
       const scopeValue = perl.createString(serializePagiScope(session.scope));
-      const entrypointValue = perl.createString("Pagi::WebDyne::application");
+      const entrypointValue = perl.createString(session.entrypoint ?? "Pagi::WebDyne::application");
       return {
         args: [sessionValue, scopeValue, entrypointValue],
         dispose: () => {
@@ -4478,33 +4563,64 @@ function createWebDyneRuntime({
     }
   }
   function dispatch(request, bindings = {}) {
+    if (mode !== "pagi") throw new Error("Invocation runtimes cannot dispatch HTTP requests");
     const runtimeConfig = webdyneRuntimeConfig(bindings);
     const scope = buildPagiScope(request);
-    const releaseExtensions = extensionManager.attachScope({ scope, bindings, request });
-    let transport;
-    try {
-      transport = createFetchPagiTransport(scope, request, { webSocketAdapter });
-    } catch (error) {
-      releaseExtensions();
-      throw error;
-    }
-    const completion = startPersistentSession(
-      scope,
-      request,
-      transport,
-      runtimeConfig
-    ).catch((error) => {
-      if (!error?.pagiErrorId) console.error("PAGI application failed:", error);
-    }).finally(() => {
+    const transport = createFetchPagiTransport(scope, request, { webSocketAdapter });
+    const completion = (async () => {
+      let releaseExtensions;
+      let applicationError;
       try {
-        releaseExtensions();
+        releaseExtensions = await extensionManager.attachScope({ scope, bindings, request });
+        await startPersistentSession(scope, request, transport, runtimeConfig);
       } catch (error) {
-        console.error("WebDyne extension cleanup failed", error);
+        applicationError = error;
+        if (!error?.pagiErrorId) console.error("PAGI application failed:", error);
+        await transport.sink.fail(error);
+        throw error;
+      } finally {
+        if (releaseExtensions) {
+          try {
+            await releaseExtensions();
+          } catch (error) {
+            console.error("WebDyne extension cleanup failed", error);
+            throw applicationError ? new AggregateError([applicationError, error], "PAGI application and extension cleanup failed", { cause: applicationError }) : error;
+          }
+        }
       }
-    });
+    })();
+    void completion.catch(() => void 0);
     return { response: transport.response, completion, type: scope.type };
   }
-  return { dispatch };
+  async function invoke({ scope, bindings = {}, entrypoint, invocation }) {
+    if (mode !== "invocation") throw new Error("invoke requires an invocation runtime");
+    if (!/^[A-Za-z_]\w*(?:::[A-Za-z_]\w*)+$/.test(entrypoint ?? "")) {
+      throw new TypeError("Invocation entrypoint must be a qualified Perl function name");
+    }
+    const transport = createInvocationTransport();
+    let release;
+    let failure;
+    try {
+      release = await extensionManager.attachScope({ scope, bindings, invocation });
+      await startPersistentSession(scope, null, transport, webdyneRuntimeConfig(bindings), entrypoint);
+      return transport.result();
+    } catch (error) {
+      failure = error;
+      throw error;
+    } finally {
+      try {
+        if (release) await release();
+      } catch (error) {
+        throw failure ? new AggregateError([failure, error], "Invocation and cleanup failed") : error;
+      } finally {
+        transport.close();
+      }
+    }
+  }
+  async function dispose() {
+    await resetPersistentRuntime(new Error("WebDyne runtime disposed"));
+  }
+  return { dispatch, invoke, dispose };
 }
 
 // node_modules/@webdyne/webdyne-zeroperl-browser/browser/channel.js
